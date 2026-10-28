@@ -1,6 +1,6 @@
 const { createClient } = require('@supabase/supabase-js');
 const { z } = require('zod');
-const { GoogleGenAI, Type } = require('@google/genai');
+const Groq = require('groq-sdk');
 
 const AdvisoryRequestSchema = z.object({
   farm_id: z.string().uuid()
@@ -33,11 +33,30 @@ const generateAdvisory = async (req, res) => {
       return res.status(404).json({ error: 'Farm not found' });
     }
 
-    // Build the AI prompt
-    const systemInstruction = 'You are an expert Agronomist and Agricultural Scientist. Your objective is to analyze farm data (soil, climate, size, water) and provide a highly specific, scientific, and actionable crop management plan. You must strictly output valid JSON matching the requested schema. Do not include markdown formatting like ```json or any conversational text. Respond ONLY with the raw JSON object.';
+    // Build the prompt
+    const systemPrompt = `You are an expert Agronomist and Agricultural Scientist. 
+Analyze farm data and provide a highly specific, scientific, and actionable crop management plan.
+You MUST respond with ONLY a valid raw JSON object — no markdown, no code fences, no explanation.
+The JSON must exactly follow this structure:
+{
+  "recommended_crops": [
+    {
+      "crop_name": "string",
+      "reasoning": "string",
+      "expected_yield_per_acre": "string"
+    }
+  ],
+  "nutrient_plan": ["string", "string"],
+  "pest_warnings": [
+    {
+      "pest_name": "string",
+      "mitigation_strategy": "string"
+    }
+  ],
+  "irrigation_schedule": "string"
+}`;
 
-    const userPrompt = `Analyze the following farm data and provide a comprehensive crop advisory plan:
-
+    const userPrompt = `Generate an agricultural advisory for the following farm:
 - Location / Region: ${farm.location_region}
 - Farm Size: ${farm.farm_size_acres} acres
 - Soil Type: ${farm.soil_type}
@@ -45,57 +64,35 @@ const generateAdvisory = async (req, res) => {
 - Climate Zone: ${farm.climate_zone}
 - Water Source: ${farm.water_source}
 
-Provide recommended crops with reasoning and expected yield per acre, a nutrient management plan, pest warnings with mitigation strategies, and an irrigation schedule.`;
+Provide at least 3 recommended crops with reasoning and expected yield per acre, at least 5 nutrient management steps, at least 3 pest warnings with mitigation strategies, and a detailed irrigation schedule.`;
 
-    const advisorySchema = {
-      type: Type.OBJECT,
-      properties: {
-        recommended_crops: {
-          type: Type.ARRAY,
-          items: {
-            type: Type.OBJECT,
-            properties: {
-              crop_name: { type: Type.STRING },
-              reasoning: { type: Type.STRING },
-              expected_yield_per_acre: { type: Type.STRING }
-            },
-            required: ['crop_name', 'reasoning', 'expected_yield_per_acre']
-          }
-        },
-        nutrient_plan: {
-          type: Type.ARRAY,
-          items: { type: Type.STRING }
-        },
-        pest_warnings: {
-          type: Type.ARRAY,
-          items: {
-            type: Type.OBJECT,
-            properties: {
-              pest_name: { type: Type.STRING },
-              mitigation_strategy: { type: Type.STRING }
-            },
-            required: ['pest_name', 'mitigation_strategy']
-          }
-        },
-        irrigation_schedule: { type: Type.STRING }
-      },
-      required: ['recommended_crops', 'nutrient_plan', 'pest_warnings', 'irrigation_schedule']
-    };
+    // Call Groq API
+    const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
-    // Call Gemini
-    const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.0-flash-exp',
-      contents: userPrompt,
-      config: {
-        responseMimeType: 'application/json',
-        responseSchema: advisorySchema
-      },
-      systemInstruction: systemInstruction
+    const completion = await groq.chat.completions.create({
+      model: 'qwen/qwen3.8-27b',
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt }
+      ],
+      response_format: { type: 'json_object' },
+      temperature: 0.7,
+      max_tokens: 2048,
     });
 
-    const advisoryData = JSON.parse(response.text);
+    const rawText = completion.choices[0]?.message?.content;
+
+    if (!rawText) {
+      return res.status(500).json({ error: 'AI returned empty response' });
+    }
+
+    let advisoryData;
+    try {
+      advisoryData = JSON.parse(rawText);
+    } catch (parseErr) {
+      console.error('JSON parse error:', parseErr, 'Raw:', rawText);
+      return res.status(500).json({ error: 'AI response was not valid JSON' });
+    }
 
     // Save to database
     const { data: advisory, error: insertError } = await supabase
@@ -116,7 +113,7 @@ Provide recommended crops with reasoning and expected yield per acre, a nutrient
     return res.status(201).json(advisory);
   } catch (err) {
     console.error('generateAdvisory error:', err);
-    return res.status(500).json({ error: 'Internal server error' });
+    return res.status(500).json({ error: err.message || 'Internal server error' });
   }
 };
 
