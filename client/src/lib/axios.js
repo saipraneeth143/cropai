@@ -23,6 +23,7 @@ api.interceptors.request.use(async (config) => {
 api.interceptors.response.use(
   (response) => response.data,
   (error) => {
+    console.error('API Error Response:', error?.response || error);
     const errData = error.response?.data || { error: error.message || 'Network error' };
     return Promise.reject(errData);
   }
